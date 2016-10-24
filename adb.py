@@ -11,6 +11,9 @@ import shutil
 import subprocess
 from threading import Thread, Lock
 
+# Global variable used to restart ADB server upon initialization of module
+__ADB_RESTART__ = True
+
 # http://developer.android.com/reference/android/view/KeyEvent.html
 __KEY_CODES__ = {
     'HOME': 3,
@@ -78,7 +81,7 @@ class HostProcess(object):
             raise ValueError('Parameter "cmd" must be of type str or list of str, instead found: %r' % cmd)
         return [cmd.strip() for cmd in cmd]
 
-    def exec_cmd(self, args, timeout=None, callback=None):
+    def exec_cmd(self, args, timeout=None, grep=None, callback=None):
 
         # If this requires current working dir change, acquire lock
         if self._singleton:
@@ -91,7 +94,7 @@ class HostProcess(object):
         # Execute and parse output
         proc = subprocess.Popen(
             cmd, shell=(os.name != 'posix' and sys.version_info < (3, 0, 0)),
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
         # Add process to internal pool
         self.proc_pool.append(proc)
@@ -101,10 +104,8 @@ class HostProcess(object):
                 output, error = proc.communicate(timeout=timeout)
             else:
                 output, error = proc.communicate()
-            error = str(error.decode('utf-8').strip())
             output = str(output.decode('utf-8').strip())
-            if len(error) > 0:
-                output = error + '\n' + output
+                
         except UnicodeDecodeError:
             pass
         except (subprocess.TimeoutExpired if sys.version_info >= (3, 3, 0) else UnicodeDecodeError):
@@ -121,6 +122,11 @@ class HostProcess(object):
             # Return to original working directory if needed
             if self._singleton:
                 self.lock.release()
+            
+            # If grep was given, filter output
+            if grep:
+                rgx = re.compile(grep)
+                output = '\n'.join([line for line in output.split('\n') if rgx.search(line)])
 
         if callback:
             callback(proc.returncode, output)
@@ -130,10 +136,18 @@ class HostProcess(object):
 class ADB(HostProcess):
     ''' Wrapper for the ADB command that includes many common operations '''
     
-    def __init__(self, default_target_device=None, debug=False):
+    def __init__(self, default_target_device=None, debug=True):
+        global __ADB_RESTART__
 
-        HostProcess.__init__(self, 'adb')
+        HostProcess.__init__(self, 'adb', debug=debug)
+        self.default_target_device = None
         
+        # Has the ADB server been restarted at least once?
+        if __ADB_RESTART__:
+            self.kill_server()
+            self.start_server()
+            __ADB_RESTART__ = False
+            
         # If we are given a device, try to connect
         if default_target_device:
             self.default_target_device = self.connect(target_device=default_target_device)
@@ -141,29 +155,40 @@ class ADB(HostProcess):
         # Internal flags
         self.pending_wakeup = False
 
-    def run(self, cmd, target_device=None):
-        if target_device is None:
+    def run(self, cmd, grep=None, target_device=None):
+        if target_device is None and self.default_target_device:
             target_device = self.default_target_device
         opt = [] if target_device is None else ['-s', target_device]
         cmd = opt + HostProcess.type_check_cmd(cmd)
-        retcode, output = HostProcess.exec_cmd(self, cmd)
+        retcode, output = HostProcess.exec_cmd(self, cmd, grep=grep)
         self._print(output)
         return output
 
-    def shell(self, cmd, target_device=None):
+    def shell(self, cmd, grep=None, target_device=None):
         cmd = ['shell'] + HostProcess.type_check_cmd(cmd)
-        return self.run(cmd, target_device=target_device)
+        return self.run(cmd, grep=grep, target_device=target_device)
 
     def connect(self, target_device=None):
         cmd = [] if target_device is None else [target_device]
+
         retcode, output = HostProcess.exec_cmd(self, ['connect'] + cmd)
         output = output.lower()
         self._print(output)
         str_check = 'connected to '
         if str_check not in output:
-            raise ConnectionError(output)
+            raise RuntimeError(output)
+            
+        # The actual device id might be slightly different
+        device_id = output.split(str_check)[1].strip() 
         
-        return output.split(str_check)[1].strip() 
+        # If this is the first connection, make it the default_target_device
+        if self.default_target_device is None:
+            self.default_target_device = device_id
+            
+        # Wait a few seconds for the connection to become active
+        time.sleep(3)
+        
+        return device_id
 
     def version(self):
         return self.run('version')
@@ -185,11 +210,13 @@ class ADB(HostProcess):
         self._print(output)
 
     def get_installed_packages(self, target_device=None):
+        packages = []
         output = self.shell('pm list packages -f', target_device=target_device)
         for package in output.splitlines():
             parts = package.split('=')
             if len(parts) == 2:
-                yield parts[1].strip()
+                packages.append(parts[1].strip())
+        return packages
 
     def get_package_activities(self, package_name, target_device=None):
         output = self.shell('dumpsys package ' + package_name)
@@ -198,13 +225,15 @@ class ADB(HostProcess):
         for mat in matches:
             activity = mat.group(1)
             if activity not in seen_activities and len(activity.split('.')) == 2:
-                yield activity
                 seen_activities.add(activity)
+        return list(seen_activities)
 
     def get_focused_activity(self, target_device=None):
-        output = self.shell('dumpsys window windows | grep -E "mCurrentFocus|mFocusedApp"',
-                            target_device=target_device)
-        curr_focus, curr_app = output.split('\n', 2)
+        curr_focus = self.shell('dumpsys window windows', grep='mCurrentFocus',
+                                target_device=target_device)
+        curr_app = self.shell('dumpsys window windows', grep='mFocusedApp',
+                              target_device=target_device)
+                              
         output = re.findall(r'[\w\.]+/[\w\.]+', curr_app)
         if len(output) == 0:
             raise RuntimeError('Current window focus could not be found in dumpsys')
@@ -225,10 +254,10 @@ class ADB(HostProcess):
     def wakeup(self, target_device=None):
         if not self.pending_wakeup:
             self.pending_wakeup = True
-            output = self.shell('dumpsys power | grep mScreenOn')
-            if output == 'mScreenOn=false':
+            output = self.shell('dumpsys power', grep='mScreenOn=|Display Power: state=')
+            if output == 'mScreenOn=false' or output == 'Display Power: state=OFF':
                 self.press_key('power', target_device=target_device)
-            elif output != 'mScreenOn=true':
+            elif output != 'mScreenOn=true' and output != 'Display Power: state=ON':
                 raise RuntimeError('Current screen state could not be found in dumpsys')
             self.pending_wakeup = False
 
@@ -272,3 +301,4 @@ class ADB(HostProcess):
     def uninstall(self, package_name, target_device=None, opts=None):
         self.run('uninstall %s %s' % (('-' + opts) if opts else '', package_name),
                  target_device=target_device)
+                 
