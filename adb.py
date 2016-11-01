@@ -10,6 +10,29 @@ import atexit
 import shutil
 import subprocess
 from threading import Thread, Lock
+from xml.etree import ElementTree
+
+def pprint(elem, level=0):
+    ''' Pretty print for ElementTree nodes (https://stackoverflow.com/a/4590052/440780) '''
+    i = "\n" + level*"  "
+    j = "\n" + (level-1)*"  "
+    if len(elem):
+        if not elem.text or not elem.text.strip():
+            elem.text = i + "  "
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
+        for subelem in elem:
+            subelem.pprint(level+1)
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = j
+    else:
+        if level and (not elem.tail or not elem.tail.strip()):
+            elem.tail = j
+    return elem
+
+# Monkey-patch the pprint function for the ElementTree.Element object
+ElementTree.Element.pprint = pprint
+
 
 # Global variable used to restart ADB server upon initialization of module
 __ADB_RESTART__ = True
@@ -65,10 +88,9 @@ class HostProcess(object):
             except OSError:
                 pass
 
-    def _print(self, output, file=None):
-        file = file or sys.stdout
+    def _print(self, *output, **kwargs):
         if self._debug and len(output) > 0:
-            print(output, file=file)
+            print(*output, **kwargs)
 
     @staticmethod
     def type_check_cmd(cmd):
@@ -104,7 +126,7 @@ class HostProcess(object):
                 output, error = proc.communicate(timeout=timeout)
             else:
                 output, error = proc.communicate()
-            output = str(output.decode('utf-8').strip())
+            output = str(output.decode('utf-8').rstrip())
                 
         except UnicodeDecodeError:
             pass
@@ -126,7 +148,8 @@ class HostProcess(object):
             # If grep was given, filter output
             if grep:
                 rgx = re.compile(grep)
-                output = '\n'.join([line for line in output.split('\n') if rgx.search(line)])
+                lines = [line.rstrip() for line in output.splitlines()]
+                output = '\n'.join([line for line in lines if rgx.search(line)])
 
         if callback:
             callback(proc.returncode, output)
@@ -168,12 +191,16 @@ class ADB(HostProcess):
         cmd = ['shell'] + HostProcess.type_check_cmd(cmd)
         return self.run(cmd, grep=grep, target_device=target_device)
 
+    def exec_out(self, cmd, grep=None, target_device=None):
+        cmd = ['exec-out'] + HostProcess.type_check_cmd(cmd)
+        return self.run(cmd, grep=grep, target_device=target_device)
+
     def connect(self, target_device=None):
         cmd = [] if target_device is None else [target_device]
 
         retcode, output = HostProcess.exec_cmd(self, ['connect'] + cmd)
         output = output.lower()
-        self._print(output)
+        self._print('>>>', output)
         str_check = 'connected to '
         if str_check not in output:
             raise RuntimeError(output)
@@ -228,7 +255,8 @@ class ADB(HostProcess):
                 seen_activities.add(activity)
         return list(seen_activities)
 
-    def get_focused_activity(self, target_device=None):
+    def get_window(self, target_device=None):
+        ''' Returns the window that currently has focus '''
         curr_focus = self.shell('dumpsys window windows', grep='mCurrentFocus',
                                 target_device=target_device)
         curr_app = self.shell('dumpsys window windows', grep='mFocusedApp',
@@ -246,19 +274,43 @@ class ADB(HostProcess):
             raise TimeoutError('Application not responding')
 
         return package_name, activity
-
-    def launch_activity(self, package_name, activity, target_device=None):
-        sep = '/.' if activity[0] != '.' else '/'
-        output = self.shell('am start -n ' + package_name + sep + activity, target_device=target_device)
+        
+    def get_view(self, target_device=None):
+        ''' Returns ElementTree object of the XML hierarchy of the current view '''
+        xml_raw = self.shell('uiautomator dump /dev/tty')[:-len('UI hierchary dumped to: /dev/tty')]
+        xml_parsed = ElementTree.fromstring(xml_raw)
+        return xml_parsed
+        
+    def launch(self, package_name, activity=None, target_device=None):
+        if activity:
+            prefix = 'am start -n '
+            suffix = ('/.' if activity[0] != '.' else '/') + activity
+        else:
+            prefix = 'monkey -p '
+            suffix = ' -c android.intent.category.LAUNCHER 1'
+            
+        output = self.shell(prefix + package_name + suffix,
+                            target_device=target_device)
+                            
+    def url(self, url, target_device=None):
+        self.shell('am start -a android.intent.action.VIEW -d "%s"' % url,
+                   target_device=target_device)
 
     def wakeup(self, target_device=None):
         if not self.pending_wakeup:
             self.pending_wakeup = True
-            output = self.shell('dumpsys power', grep='mScreenOn=|Display Power: state=')
-            if output == 'mScreenOn=false' or output == 'Display Power: state=OFF':
-                self.press_key('power', target_device=target_device)
-            elif output != 'mScreenOn=true' and output != 'Display Power: state=ON':
-                raise RuntimeError('Current screen state could not be found in dumpsys')
+            isawake = lambda: self.shell('dumpsys power', grep='mScreenOn=|Display Power: state=')
+            
+            output = isawake()
+            if 'mScreenOn=false' in output or 'state=OFF' in output:
+                self._print('Waking up screen by pressing power button...')
+                self.press_key('power', target_device=target_device, wait=3)
+                self._print('Unlocking screen by pressing menu button...')
+                self.press_key('menu', target_device=target_device, wait=3)
+                output = isawake()
+            
+            if 'mScreenOn=true' not in output and 'state=ON' not in output:
+                raise RuntimeError('Wakeup failed or current screen state unknown')
             self.pending_wakeup = False
 
     def screenshot(self, target_device=None):
@@ -273,6 +325,7 @@ class ADB(HostProcess):
 
         tmp = str(uuid.uuid4())
         self.wakeup(target_device=target_device)
+        # adb exec-out screencap -p > test.png
         self.shell(['screencap', '/sdcard/%s.png' % tmp], target_device=target_device)
         self.run(['pull', '/sdcard/%s.png' % tmp, '%s.png' % tmp], target_device=target_device)
         self.shell(['rm', '/sdcard/%s.png' % tmp], target_device=target_device)
